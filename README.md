@@ -30,11 +30,47 @@ bash  curl  openssl  timeout
 
 ---
 
-## 安装
+## 安装 / 运行
+
+### 一键下载并运行
+
+**推荐（下载到本地后运行，菜单与交互输入均正常）：**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/chnnic/Reality-SNI-Check/main/Reality-SNI-Check.sh -o Reality-SNI-Check.sh && chmod +x Reality-SNI-Check.sh && ./Reality-SNI-Check.sh
+```
+
+文件会留在当前目录，之后直接 `./Reality-SNI-Check.sh` 即可再次运行。
+
+**管道一键运行（进程替换，保留终端输入，菜单可用）：**
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/chnnic/Reality-SNI-Check/main/Reality-SNI-Check.sh)
+```
+
+> ⚠️ 不要用 `curl ... | bash`——管道会占用 stdin，导致菜单和交互输入读不到键盘、直接退出。请用上面 `bash <(...)` 的写法。
+
+### 仅下载（不自动运行）
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/chnnic/Reality-SNI-Check/main/Reality-SNI-Check.sh -o Reality-SNI-Check.sh
 chmod +x Reality-SNI-Check.sh
+```
+
+### 安装为全局命令（任意目录直接调用）
+
+装到 `PATH`，之后在任何目录敲 `reality-sni-check` 即可运行：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/chnnic/Reality-SNI-Check/main/Reality-SNI-Check.sh -o /usr/local/bin/reality-sni-check && chmod +x /usr/local/bin/reality-sni-check && reality-sni-check
+```
+
+以后升级：重跑上面这条即可覆盖为最新版。
+
+### 无 curl 时用 wget
+
+```bash
+wget -qO Reality-SNI-Check.sh https://raw.githubusercontent.com/chnnic/Reality-SNI-Check/main/Reality-SNI-Check.sh && chmod +x Reality-SNI-Check.sh && ./Reality-SNI-Check.sh
 ```
 
 > ⚠️ 必须在**落地服务器**上运行，不是本地。测的是「从落地机方向」到目标站的握手延迟——这才是 Reality 回源实际付出的成本。
