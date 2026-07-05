@@ -447,7 +447,7 @@ print_header() {
 # 单行渲染 + 收集用于排序 (host|ac|qualify)
 RESULTS=()
 render_row() {
-  local host="$1" out ac tls13 h2 tempkey chain code certok qualify mark ac_disp x25519="no"
+  local host="$1" out ac tls13 h2 tempkey chain code certok qualify mark result_tag ac_disp x25519="no"
   out=$(probe_host "$host")
   read -r ac tls13 h2 tempkey chain code certok <<< "$out"
 
@@ -470,17 +470,16 @@ render_row() {
   [[ "$chain" =~ ^[0-9]+$ && "$chain" -ge 1 && "$chain" -le 3 ]] && chain_ok="yes"
 
   # Reality 合规: TLS1.3 必须; h2 / X25519 / 短证书链 三者齐 = 推荐
-  local full="no"
   if [[ "$tls13" == "yes" && "$certok" != "yes" ]]; then
-    qualify="${C_R}✗ 证书${NC}"; mark="bad"
+    qualify="${C_R}✗ 证书${NC}"; mark="bad"; result_tag="bad"
   elif [[ "$tls13" == "yes" && "$h2" == "yes" && "$x25519" == "yes" && "$chain_ok" == "yes" ]]; then
-    qualify="${C_G}✓ 推荐${NC}"; mark="ok"; full="yes"
+    qualify="${C_G}✓ 推荐${NC}"; mark="ok"; result_tag="full"
   elif [[ "$tls13" == "yes" && "$chain" -gt 3 ]]; then
-    qualify="${C_Y}△ 链偏长${NC}"; mark="ok"      # 其它没问题但链太长，能试不首选
+    qualify="${C_Y}△ 链偏长${NC}"; mark="ok"; result_tag="chain"      # 其它没问题但链太长，能试不首选
   elif [[ "$tls13" == "yes" ]]; then
-    qualify="${C_Y}△ 可用${NC}"; mark="ok"        # 缺 h2 或 x25519
+    qualify="${C_Y}△ 可用${NC}"; mark="ok"; result_tag="partial"        # 缺 h2 或 x25519
   else
-    qualify="${C_R}✗ 不可${NC}"; mark="bad"        # 无 TLS1.3
+    qualify="${C_R}✗ 不可${NC}"; mark="bad"; result_tag="bad"        # 无 TLS1.3
   fi
 
   ac_disp=$(awk "BEGIN{printf \"%.3f\", $ac}")
@@ -497,7 +496,7 @@ render_row() {
   if [[ "$mark" == "bad" ]]; then
     RESULTS+=("$host|999|no")
   else
-    RESULTS+=("$host|$ac|$([[ "$full" == "yes" ]] && echo yes || echo partial)")
+    RESULTS+=("$host|$ac|$result_tag")
   fi
 }
 
@@ -528,22 +527,42 @@ run_categories() {
 # 排序输出最佳推荐
 print_best() {
   echo
-  printf "${C_B}══ 本机最优 SNI 排名 (仅列证书有效且 TLS1.3 通过者，按握手升序) ══${NC}\n"
-  local sorted top1=""
+  printf "${C_B}══ 本机最优 SNI 排名 (全合规优先，组内按握手升序) ══${NC}\n"
+  local sorted top1="" top_tag=""
   sorted=$(printf '%s\n' "${RESULTS[@]}" \
-    | awk -F'|' '$2!=999' | sort -t'|' -k2 -n)
+    | awk -F'|' '$2!=999 {
+        p=3
+        if ($3=="full") p=0
+        else if ($3=="chain") p=1
+        else if ($3=="partial") p=2
+        printf "%d|%s\n", p, $0
+      }' \
+    | sort -t'|' -k1,1n -k3,3n \
+    | cut -d'|' -f2-)
   if [[ -z "$sorted" ]]; then
     printf "${C_R}没有站点满足证书有效且通过 TLS1.3，检查落地机出网/换候选列表${NC}\n"; return
   fi
   local rank=1
   while IFS='|' read -r host ac tag; do
     local badge=""
-    [[ "$tag" == "yes" ]] && badge="${C_G}[全合规]${NC}" || badge="${C_Y}[缺h2/x25519]${NC}"
+    case "$tag" in
+      full)    badge="${C_G}[全合规]${NC}" ;;
+      chain)   badge="${C_Y}[链偏长]${NC}" ;;
+      partial) badge="${C_Y}[缺h2/x25519]${NC}" ;;
+      *)       badge="${C_Y}[可用]${NC}" ;;
+    esac
     printf "  %d) ${C_B}%-24s${NC} %ss  %b\n" "$rank" "$host" "$(awk "BEGIN{printf \"%.3f\",$ac}")" "$badge"
-    [[ $rank -eq 1 ]] && top1="$host"
+    if [[ $rank -eq 1 ]]; then
+      top1="$host"
+      top_tag="$tag"
+    fi
     ((rank++)); [[ $rank -gt 6 ]] && break
   done <<< "$sorted"
-  [[ -n "$top1" ]] && printf "\n${C_G}${C_B}→ 建议 dest/SNI: %s${NC}\n" "$top1"
+  if [[ -n "$top1" && "$top_tag" == "full" ]]; then
+    printf "\n${C_G}${C_B}→ 建议 dest/SNI: %s${NC}\n" "$top1"
+  elif [[ -n "$top1" ]]; then
+    printf "\n${C_Y}${C_B}→ 无全合规候选，备选 dest/SNI: %s${NC}\n" "$top1"
+  fi
 }
 
 # 交互输入模式：一行可输入多个，逗号或空格分隔
