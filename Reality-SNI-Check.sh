@@ -325,6 +325,28 @@ validate_options() {
   fi
 }
 
+OPENSSL_X25519_ARGS=()
+detect_openssl_x25519_args() {
+  local help
+  help=$(openssl s_client -help 2>&1 || true)
+  if grep -q -- "-groups" <<< "$help"; then
+    OPENSSL_X25519_ARGS=(-groups X25519)
+  elif grep -q -- "-curves" <<< "$help"; then
+    OPENSSL_X25519_ARGS=(-curves X25519)
+  fi
+}
+
+probe_x25519() {
+  local host="$1" xs
+  [[ ${#OPENSSL_X25519_ARGS[@]} -gt 0 ]] || return 1
+  xs=$(echo -n | timeout "$TIMEOUT" openssl s_client -connect "${host}:443" \
+        -servername "$host" -verify_hostname "$host" -alpn h2,http/1.1 \
+        "${OPENSSL_X25519_ARGS[@]}" 2>&1 | tr -d '\0')
+  grep -qE "New, TLSv1\.3|Protocol *: *TLSv1\.3" <<< "$xs" || return 1
+  grep -qiE "Verify return code: 0 \(ok\)|Verification: OK" <<< "$xs" || return 1
+  return 0
+}
+
 list_cats() {
   printf "${C_B}可用分类 (用 -c 选，逗号分隔):${NC}\n"
   for k in "${CAT_KEYS[@]}"; do
@@ -348,6 +370,7 @@ while getopts "a:c:r:n:t:ilh" opt; do
 done
 
 validate_options
+detect_openssl_x25519_args
 
 # 环境变量覆盖：SNI_HOSTS 优先级最高，直接替换全部内置分类
 SNI_OVERRIDE=()
@@ -377,6 +400,9 @@ probe_host() {
   grep -qiE "Verify return code: 0 \(ok\)|Verification: OK" <<< "$so" && certok="yes"
   tempkey=$(grep "Server Temp Key" <<< "$so" | sed 's/.*Server Temp Key: *//; s/,.*//' | head -1)
   [[ -z "$tempkey" ]] && tempkey="-"
+  if [[ "$tls13" == "yes" && "$certok" == "yes" && "$tempkey" != *X25519* ]] && probe_x25519 "$host"; then
+    tempkey="X25519"
+  fi
   chain=$(grep -c "BEGIN CERTIFICATE" <<< "$so")   # 证书链层数(叶子+中间)
   [[ -z "$chain" ]] && chain=0
   local handshake_ok="no"; [[ "$chain" -ge 1 ]] && handshake_ok="yes"
