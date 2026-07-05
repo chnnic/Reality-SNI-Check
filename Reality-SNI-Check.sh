@@ -50,7 +50,6 @@ GRP_cdn=(                      # 全球 CDN / anycast，任何区就近命中，
   gateway.icloud.com
   swscan.apple.com            # Apple 软更源，链短握手干净，经典 dest
   www.amazon.com
-  www.microsoft.com           # 常因证书链长不合规，留着看它被筛掉
   addons.mozilla.org          # 社区长期验证的干净 dest
   www.python.org
   www.fastly.com
@@ -4240,6 +4239,13 @@ GFWLIST_SUFFIXES=(
   "zzcloud.me"
 )
 
+host_reality_block() {
+  case "${1,,}" in
+    www.microsoft.com) echo cert-chain ;;
+    *) echo "" ;;
+  esac
+}
+
 host_sni_risk() {
   local host="${1,,}" suffix
   host="${host%.}"
@@ -4457,7 +4463,7 @@ print_header() {
 # 单行渲染 + 收集用于排序 (host|ac|qualify)
 RESULTS=()
 render_row() {
-  local host="$1" out ac tls13 h2 tempkey chain code certok qualify mark result_tag ac_disp x25519="no" sni_risk=""
+  local host="$1" out ac tls13 h2 tempkey chain code certok qualify mark result_tag ac_disp x25519="no" sni_risk="" reality_block=""
   out=$(probe_host "$host")
   read -r ac tls13 h2 tempkey chain code certok <<< "$out"
 
@@ -4475,6 +4481,7 @@ render_row() {
   fi
 
   [[ "$tempkey" == *X25519* ]] && x25519="yes"
+  reality_block=$(host_reality_block "$host")
   sni_risk=$(host_sni_risk "$host")
   # 证书链: 1~2 短链最优, 3 尚可, 4+ 偏长(Reality 借用握手易出问题)
   local chain_ok="no"
@@ -4483,6 +4490,8 @@ render_row() {
   # Reality 合规: TLS1.3 必须; h2 / X25519 / 短证书链 三者齐 = 推荐
   if [[ "$tls13" == "yes" && "$certok" != "yes" ]]; then
     qualify="${C_R}✗ 证书${NC}"; mark="bad"; result_tag="bad"
+  elif [[ -n "$reality_block" ]]; then
+    qualify="${C_R}✗ 链风险${NC}"; mark="bad"; result_tag="bad"
   elif [[ "$tls13" == "yes" && -n "$sni_risk" ]]; then
     qualify="${C_Y}△ SNI风险${NC}"; mark="bad"; result_tag="risk"
   elif [[ "$tls13" == "yes" && "$h2" == "yes" && "$x25519" == "yes" && "$chain_ok" == "yes" ]]; then
