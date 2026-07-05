@@ -331,7 +331,7 @@ probe_host() {
   # 详情：一次 openssl -showcerts 拿 TLS1.3 / ALPN(h2) / 临时密钥(X25519) / 证书链层数
   local so tls13="no" h2="no" tempkey="-" chain=0
   so=$(echo -n | timeout "$TIMEOUT" openssl s_client -connect "${host}:443" \
-        -servername "$host" -alpn h2,http/1.1 -showcerts 2>/dev/null)
+        -servername "$host" -alpn h2,http/1.1 -showcerts 2>/dev/null | tr -d '\0')
   grep -qE "New, TLSv1\.3|Protocol *: *TLSv1\.3" <<< "$so" && tls13="yes"
   grep -qi "ALPN protocol: h2" <<< "$so" && h2="yes"
   tempkey=$(grep "Server Temp Key" <<< "$so" | sed 's/.*Server Temp Key: *//; s/,.*//' | head -1)
