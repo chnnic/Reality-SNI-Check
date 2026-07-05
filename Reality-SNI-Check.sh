@@ -6,9 +6,9 @@
 #  (TLS1.3 + h2 + X25519) 的 SNI 候选，供 VLESS-Reality dest 选用。
 #
 #  用法:
-#    ./reality-sni-check.sh                 # 测全部内置分类
+#    ./reality-sni-check.sh                 # 无参数 → 进交互菜单(选测试项)
 #    ./reality-sni-check.sh -l              # 列出所有分类
-#    ./reality-sni-check.sh -c edu          # 只测"大学"分类
+#    ./reality-sni-check.sh -c edu          # 直接只测"大学"分类(跳过菜单)
 #    ./reality-sni-check.sh -c edu,tech     # 测多个分类(逗号/空格分隔)
 #    ./reality-sni-check.sh -a "a.com b.com"# 追加自定义站点一起测
 #    ./reality-sni-check.sh -i              # 只进交互输入模式(一行可多站)
@@ -419,33 +419,101 @@ interactive_loop() {
   done
 }
 
+# ============================  交互菜单  ======================================
+# 从分类里多选 (数字，空格/逗号分隔; a=全部; 回车返回)
+menu_pick_categories() {
+  echo
+  printf "${C_B}选择分类 (数字，空格或逗号分隔; a=全部; 回车返回):${NC}\n"
+  local i=1 k
+  for k in "${CAT_KEYS[@]}"; do
+    printf "  ${C_C}%2d${NC}) %-7s %s ${C_D}(%d 站)${NC}\n" \
+      "$i" "$k" "$(cat_label "$k")" "$(cat_hosts "$k" | grep -c .)"
+    ((i++))
+  done
+  printf "${C_C}选择 > ${NC}"; local sel; read -r sel
+  [[ -z "$sel" ]] && return 1
+  if [[ "$sel" == "a" || "$sel" == "A" ]]; then SEL_CATS=("${CAT_KEYS[@]}"); return 0; fi
+  sel="${sel//,/ }"; SEL_CATS=(); local n
+  for n in $sel; do
+    [[ "$n" =~ ^[0-9]+$ ]] || continue
+    [[ "$n" -ge 1 && "$n" -le ${#CAT_KEYS[@]} ]] && SEL_CATS+=("${CAT_KEYS[$((n-1))]}")
+  done
+  [[ ${#SEL_CATS[@]} -eq 0 ]] && return 1
+  return 0
+}
+
+# 设置探测次数/超时
+settings_menu() {
+  echo
+  printf "${C_B}当前设置: 每站探测 %d 次 · 单次超时 %d 秒${NC}\n" "$ROUNDS" "$TIMEOUT"
+  printf "新的探测次数 (回车不改): "; local r; read -r r
+  [[ "$r" =~ ^[0-9]+$ && "$r" -ge 1 ]] && ROUNDS="$r"
+  printf "新的超时秒数 (回车不改): "; local t; read -r t
+  [[ "$t" =~ ^[0-9]+$ && "$t" -ge 1 ]] && TIMEOUT="$t"
+  printf "${C_G}已更新: %d 次 · %d 秒${NC}\n" "$ROUNDS" "$TIMEOUT"
+}
+
+# 跑选定分类并出排名
+run_selected() {
+  RESULTS=()
+  run_categories "$@"
+  print_best
+}
+
+# 主菜单
+main_menu() {
+  local TOTAL_SITES; TOTAL_SITES=$(for k in "${CAT_KEYS[@]}"; do cat_hosts "$k"; done | grep -c .)
+  while true; do
+    echo
+    printf "${C_B}════════ Reality SNI 检测 · 主菜单 ════════${NC}\n"
+    printf "  ${C_C}1${NC}) 快速测试   ${C_D}(cdn + cloud + tech，最常用)${NC}\n"
+    printf "  ${C_C}2${NC}) 全部分类   ${C_D}(%d 站，较慢)${NC}\n" "$TOTAL_SITES"
+    printf "  ${C_C}3${NC}) 选择分类测试\n"
+    printf "  ${C_C}4${NC}) 自定义网址检测   ${C_D}(一行可多站)${NC}\n"
+    printf "  ${C_C}5${NC}) 设置   ${C_D}(次数=%d 超时=%ds)${NC}\n" "$ROUNDS" "$TIMEOUT"
+    printf "  ${C_C}0${NC}) 退出\n"
+    printf "${C_C}请选择 > ${NC}"; local c; read -r c || break
+    case "$c" in
+      1) run_selected cdn cloud tech ;;
+      2) run_selected "${CAT_KEYS[@]}" ;;
+      3) if menu_pick_categories; then run_selected "${SEL_CATS[@]}"; fi ;;
+      4) interactive_loop ;;
+      5) settings_menu ;;
+      0|q|Q) printf "${C_D}再见。${NC}\n"; break ;;
+      "") : ;;
+      *) printf "${C_R}无效选择: %s${NC}\n" "$c" ;;
+    esac
+  done
+}
+
 # ==============================  主流程  ======================================
 printf "${C_B}Reality SNI 候选检测${NC}  ${C_D}(每站%d次取最小 · 超时%ds)${NC}\n" "$ROUNDS" "$TIMEOUT"
 printf "${C_D}仅用于连通性/TLS 握手检测，请在符合当地法律法规与服务条款前提下使用，后果自负。${NC}\n"
 
+# -i 只进交互输入
 if [[ "$INTERACTIVE_ONLY" -eq 1 ]]; then
+  interactive_loop; exit 0
+fi
+
+# 传了 CLI 参数(分类/追加/SNI_HOSTS 覆盖) → 直接跑，不进菜单
+if [[ ${#SNI_OVERRIDE[@]} -gt 0 || ${#SEL_CATS[@]} -gt 0 || ${#EXTRA_HOSTS[@]} -gt 0 ]]; then
+  RESULTS=()
+  if [[ ${#SNI_OVERRIDE[@]} -gt 0 ]]; then
+    run_batch "${SNI_OVERRIDE[@]}"
+  else
+    [[ ${#SEL_CATS[@]} -eq 0 ]] && SEL_CATS=("${CAT_KEYS[@]}")
+    run_categories "${SEL_CATS[@]}"
+    if [[ ${#EXTRA_HOSTS[@]} -gt 0 ]]; then
+      printf "\n${C_B}▎追加站点  ${C_D}[-a]${NC}\n"
+      run_batch "${EXTRA_HOSTS[@]}"
+    fi
+  fi
+  print_best
+  echo; printf "${C_D}(可继续输入网址补测，直接回车退出)${NC}\n"
   interactive_loop
+  printf "${C_D}完成。${NC}\n"
   exit 0
 fi
 
-RESULTS=()
-if [[ ${#SNI_OVERRIDE[@]} -gt 0 ]]; then
-  # SNI_HOSTS 覆盖：忽略分类，直接测这批
-  run_batch "${SNI_OVERRIDE[@]}"
-else
-  # 选定分类(默认全部) + -a 追加
-  if [[ ${#SEL_CATS[@]} -eq 0 ]]; then SEL_CATS=("${CAT_KEYS[@]}"); fi
-  run_categories "${SEL_CATS[@]}"
-  if [[ ${#EXTRA_HOSTS[@]} -gt 0 ]]; then
-    printf "\n${C_B}▎追加站点  ${C_D}[-a]${NC}\n"
-    run_batch "${EXTRA_HOSTS[@]}"
-  fi
-fi
-
-print_best
-
-# 批量测完后，再给一次交互补测的机会
-echo
-printf "${C_D}(可继续输入网址补测，直接回车退出)${NC}\n"
-interactive_loop
-printf "${C_D}完成。${NC}\n"
+# 无参数 → 进菜单
+main_menu
