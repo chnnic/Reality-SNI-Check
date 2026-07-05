@@ -269,20 +269,11 @@ normalize_host() {
   printf '%s' "$h"
 }
 
-# 探测单个站点，输出: "minAppconnect tls13 h2 tempkey chain httpcode"
+# 探测单个站点，输出: "minHandshake tls13 h2 tempkey chain httpcode"
 probe_host() {
-  local host="$1" best="" code="-" line ac
-  # 延迟: curl 取 ROUNDS 次 time_appconnect 最小值
-  for _ in $(seq 1 "$ROUNDS"); do
-    line=$(curl -sS -o /dev/null --max-time "$TIMEOUT" \
-        -w "%{time_appconnect} %{http_code}" "https://${host}/" 2>/dev/null) || continue
-    ac="${line%% *}"; code="${line##* }"
-    [[ -z "$ac" || "$ac" == "0.000000" ]] && continue
-    if [[ -z "$best" ]] || awk "BEGIN{exit !($ac < $best)}"; then best="$ac"; fi
-  done
-  [[ -z "$best" ]] && { printf 'FAIL - - - - %s' "$code"; return; }
+  local host="$1" best="" code="-" line ac hc
 
-  # 一次 openssl -showcerts 同时拿: TLS1.3 / ALPN(h2) / 临时密钥(X25519) / 证书链层数
+  # 详情：一次 openssl -showcerts 拿 TLS1.3 / ALPN(h2) / 临时密钥(X25519) / 证书链层数
   local so tls13="no" h2="no" tempkey="-" chain=0
   so=$(echo -n | timeout "$TIMEOUT" openssl s_client -connect "${host}:443" \
         -servername "$host" -alpn h2,http/1.1 -showcerts 2>/dev/null)
@@ -292,7 +283,35 @@ probe_host() {
   [[ -z "$tempkey" ]] && tempkey="-"
   chain=$(grep -c "BEGIN CERTIFICATE" <<< "$so")   # 证书链层数(叶子+中间)
   [[ -z "$chain" ]] && chain=0
+  local handshake_ok="no"; [[ "$chain" -ge 1 ]] && handshake_ok="yes"
 
+  # 延迟：只测 TLS 握手(time_appconnect)——这正是 Reality 关心的、与 HTTP 层无关。
+  #   用 --http1.1 避开部分站(Akamai 等)对裸 curl 的 h2 INTERNAL_ERROR；
+  #   即使 HTTP 被拦(code=000/403)，握手时间仍有效，照常采用，不再误判失败。
+  for _ in $(seq 1 "$ROUNDS"); do
+    line=$(curl -sS -o /dev/null --http1.1 --max-time "$TIMEOUT" \
+        -w "%{time_appconnect} %{http_code}" "https://${host}/" 2>/dev/null)
+    ac="${line%% *}"; hc="${line##* }"
+    if [[ -n "$ac" && "$ac" != "0.000000" && "$ac" != "0" ]]; then
+      [[ -n "$hc" && "$hc" != "000" ]] && code="$hc"
+      if [[ -z "$best" ]] || awk "BEGIN{exit !($ac < $best)}"; then best="$ac"; fi
+    fi
+  done
+
+  # curl 一次握手时间都没拿到，但 openssl 握手其实成功 → 用 openssl 计时兜底
+  if [[ -z "$best" && "$handshake_ok" == "yes" ]]; then
+    local t0 t1
+    t0=$(date +%s.%N 2>/dev/null)
+    echo -n | timeout "$TIMEOUT" openssl s_client -connect "${host}:443" \
+         -servername "$host" >/dev/null 2>&1
+    t1=$(date +%s.%N 2>/dev/null)
+    if [[ -n "$t0" && -n "$t1" ]]; then
+      best=$(awk "BEGIN{d=$t1-$t0; if(d>0)printf \"%.3f\",d; else print \"\"}")
+      [[ -n "$best" ]] && code="tls"    # 标记：握手可用，HTTP 层无响应
+    fi
+  fi
+
+  [[ -z "$best" ]] && { printf 'FAIL - - - - %s' "$code"; return; }
   printf '%s %s %s %s %s %s' "$best" "$tls13" "$h2" "$tempkey" "$chain" "$code"
 }
 
@@ -460,12 +479,24 @@ run_selected() {
   print_best
 }
 
+# 清屏 (仅终端下生效，管道/重定向不清，避免破坏日志)
+cls() {
+  [[ -t 1 ]] || return 0
+  if command -v clear >/dev/null 2>&1; then clear; else printf '\033[2J\033[H'; fi
+}
+
+# 看完结果后暂停，回车返回主菜单
+pause_return() {
+  printf "\n${C_D}按回车返回主菜单...${NC}"; read -r _ || true
+}
+
 # 主菜单
 main_menu() {
   local TOTAL_SITES; TOTAL_SITES=$(for k in "${CAT_KEYS[@]}"; do cat_hosts "$k"; done | grep -c .)
   while true; do
-    echo
+    cls                                   # 返回/进入主菜单都清屏
     printf "${C_B}════════ Reality SNI 检测 · 主菜单 ════════${NC}\n"
+    printf "${C_D}仅用于连通性/TLS 握手检测，请合规使用，后果自负${NC}\n\n"
     printf "  ${C_C}1${NC}) 快速测试   ${C_D}(cdn + cloud + tech，最常用)${NC}\n"
     printf "  ${C_C}2${NC}) 全部分类   ${C_D}(%d 站，较慢)${NC}\n" "$TOTAL_SITES"
     printf "  ${C_C}3${NC}) 选择分类测试\n"
@@ -474,14 +505,14 @@ main_menu() {
     printf "  ${C_C}0${NC}) 退出\n"
     printf "${C_C}请选择 > ${NC}"; local c; read -r c || break
     case "$c" in
-      1) run_selected cdn cloud tech ;;
-      2) run_selected "${CAT_KEYS[@]}" ;;
-      3) if menu_pick_categories; then run_selected "${SEL_CATS[@]}"; fi ;;
-      4) interactive_loop ;;
-      5) settings_menu ;;
-      0|q|Q) printf "${C_D}再见。${NC}\n"; break ;;
-      "") : ;;
-      *) printf "${C_R}无效选择: %s${NC}\n" "$c" ;;
+      1) cls; run_selected cdn cloud tech;        pause_return ;;
+      2) cls; run_selected "${CAT_KEYS[@]}";       pause_return ;;
+      3) cls; if menu_pick_categories; then run_selected "${SEL_CATS[@]}"; pause_return; fi ;;
+      4) cls; interactive_loop;                    pause_return ;;
+      5) cls; settings_menu;                       pause_return ;;
+      0|q|Q) cls; printf "${C_D}再见。${NC}\n"; break ;;
+      "") : ;;                                     # 空输入：循环顶部重绘
+      *) printf "${C_R}无效选择: %s${NC}\n" "$c"; sleep 1 ;;
     esac
   done
 }
