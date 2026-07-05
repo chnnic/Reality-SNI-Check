@@ -286,7 +286,44 @@ else
   C_B=""; C_G=""; C_Y=""; C_R=""; C_D=""; C_C=""; NC=""
 fi
 
-usage() { grep '^#' "$0" | sed 's/^# \{0,1\}//' | head -22; exit 0; }
+usage() { grep '^#' "$0" | sed '/^#!/d; s/^# \{0,1\}//' | head -22; exit 0; }
+
+die() {
+  printf "%s错误: %s%s\n" "$C_R" "$*" "$NC" >&2
+  exit 1
+}
+
+is_positive_int() {
+  [[ "$1" =~ ^[1-9][0-9]*$ ]]
+}
+
+category_exists() {
+  local want="$1" k
+  for k in "${CAT_KEYS[@]}"; do
+    [[ "$k" == "$want" ]] && return 0
+  done
+  return 1
+}
+
+region_exists() {
+  local want="$1" r
+  for r in "${REGION_KEYS[@]}"; do
+    [[ "$r" == "$want" ]] && return 0
+  done
+  return 1
+}
+
+validate_options() {
+  local k
+  is_positive_int "$ROUNDS" || die "-n 必须是正整数: $ROUNDS"
+  is_positive_int "$TIMEOUT" || die "-t 必须是正整数秒数: $TIMEOUT"
+  for k in "${SEL_CATS[@]}"; do
+    category_exists "$k" || die "未知分类: $k"
+  done
+  if [[ -n "$SEL_REGION" ]]; then
+    region_exists "$SEL_REGION" || die "未知地区: $SEL_REGION"
+  fi
+}
 
 list_cats() {
   printf "${C_B}可用分类 (用 -c 选，逗号分隔):${NC}\n"
@@ -310,6 +347,8 @@ while getopts "a:c:r:n:t:ilh" opt; do
   esac
 done
 
+validate_options
+
 # 环境变量覆盖：SNI_HOSTS 优先级最高，直接替换全部内置分类
 SNI_OVERRIDE=()
 [[ -n "${SNI_HOSTS:-}" ]] && read -r -a SNI_OVERRIDE <<< "$SNI_HOSTS"
@@ -324,16 +363,18 @@ normalize_host() {
   printf '%s' "$h"
 }
 
-# 探测单个站点，输出: "minHandshake tls13 h2 tempkey chain httpcode"
+# 探测单个站点，输出: "minHandshake tls13 h2 tempkey chain httpcode certok"
 probe_host() {
   local host="$1" best="" code="-" line ac hc
 
-  # 详情：一次 openssl -showcerts 拿 TLS1.3 / ALPN(h2) / 临时密钥(X25519) / 证书链层数
-  local so tls13="no" h2="no" tempkey="-" chain=0
+  # 详情：一次 openssl -showcerts 拿 TLS1.3 / ALPN(h2) / 临时密钥(X25519) / 证书链层数 / 证书验证结果
+  local so tls13="no" h2="no" tempkey="-" chain=0 certok="no"
   so=$(echo -n | timeout "$TIMEOUT" openssl s_client -connect "${host}:443" \
-        -servername "$host" -alpn h2,http/1.1 -showcerts 2>/dev/null | tr -d '\0')
+        -servername "$host" -verify_hostname "$host" -alpn h2,http/1.1 \
+        -showcerts 2>&1 | tr -d '\0')
   grep -qE "New, TLSv1\.3|Protocol *: *TLSv1\.3" <<< "$so" && tls13="yes"
   grep -qi "ALPN protocol: h2" <<< "$so" && h2="yes"
+  grep -qiE "Verify return code: 0 \(ok\)|Verification: OK" <<< "$so" && certok="yes"
   tempkey=$(grep "Server Temp Key" <<< "$so" | sed 's/.*Server Temp Key: *//; s/,.*//' | head -1)
   [[ -z "$tempkey" ]] && tempkey="-"
   chain=$(grep -c "BEGIN CERTIFICATE" <<< "$so")   # 证书链层数(叶子+中间)
@@ -354,11 +395,11 @@ probe_host() {
   done
 
   # curl 一次握手时间都没拿到，但 openssl 握手其实成功 → 用 openssl 计时兜底
-  if [[ -z "$best" && "$handshake_ok" == "yes" ]]; then
+  if [[ -z "$best" && "$handshake_ok" == "yes" && "$certok" == "yes" ]]; then
     local t0 t1
     t0=$(date +%s.%N 2>/dev/null)
     echo -n | timeout "$TIMEOUT" openssl s_client -connect "${host}:443" \
-         -servername "$host" >/dev/null 2>&1
+         -servername "$host" -verify_hostname "$host" -verify_return_error >/dev/null 2>&1
     t1=$(date +%s.%N 2>/dev/null)
     if [[ -n "$t0" && -n "$t1" ]]; then
       best=$(awk "BEGIN{d=$t1-$t0; if(d>0)printf \"%.3f\",d; else print \"\"}")
@@ -366,8 +407,8 @@ probe_host() {
     fi
   fi
 
-  [[ -z "$best" ]] && { printf 'FAIL - - - - %s' "$code"; return; }
-  printf '%s %s %s %s %s %s' "$best" "$tls13" "$h2" "$tempkey" "$chain" "$code"
+  [[ -z "$best" ]] && { printf 'FAIL %s %s %s %s %s %s' "$tls13" "$h2" "$tempkey" "$chain" "$code" "$certok"; return; }
+  printf '%s %s %s %s %s %s %s' "$best" "$tls13" "$h2" "$tempkey" "$chain" "$code" "$certok"
 }
 
 # 表头
@@ -380,11 +421,17 @@ print_header() {
 # 单行渲染 + 收集用于排序 (host|ac|qualify)
 RESULTS=()
 render_row() {
-  local host="$1" out ac tls13 h2 tempkey chain code qualify mark ac_disp x25519="no"
+  local host="$1" out ac tls13 h2 tempkey chain code certok qualify mark ac_disp x25519="no"
   out=$(probe_host "$host")
-  read -r ac tls13 h2 tempkey chain code <<< "$out"
+  read -r ac tls13 h2 tempkey chain code certok <<< "$out"
 
   if [[ "$ac" == "FAIL" ]]; then
+    if [[ "$tls13" == "yes" && "$certok" != "yes" ]]; then
+      printf "${C_R}%-24s %10s  %-6s %-4s %-14s %-4s %-5s %s${NC}\n" \
+        "$host" "证书无效" "$tls13" "$h2" "${tempkey:0:14}" "$chain" "$code" "✗ 证书"
+      RESULTS+=("$host|999|no")
+      return
+    fi
     printf "${C_R}%-24s %10s  %-6s %-4s %-14s %-4s %-5s %s${NC}\n" \
       "$host" "超时/失败" "-" "-" "-" "-" "$code" "✗"
     RESULTS+=("$host|999|no")
@@ -398,7 +445,9 @@ render_row() {
 
   # Reality 合规: TLS1.3 必须; h2 / X25519 / 短证书链 三者齐 = 推荐
   local full="no"
-  if [[ "$tls13" == "yes" && "$h2" == "yes" && "$x25519" == "yes" && "$chain_ok" == "yes" ]]; then
+  if [[ "$tls13" == "yes" && "$certok" != "yes" ]]; then
+    qualify="${C_R}✗ 证书${NC}"; mark="bad"
+  elif [[ "$tls13" == "yes" && "$h2" == "yes" && "$x25519" == "yes" && "$chain_ok" == "yes" ]]; then
     qualify="${C_G}✓ 推荐${NC}"; mark="ok"; full="yes"
   elif [[ "$tls13" == "yes" && "$chain" -gt 3 ]]; then
     qualify="${C_Y}△ 链偏长${NC}"; mark="ok"      # 其它没问题但链太长，能试不首选
@@ -437,7 +486,7 @@ run_batch() {
 
 # 按分类分组跑：每类一个小标题，最后统一排名
 run_categories() {
-  local cats=("$@") k host first=1
+  local cats=("$@") k host
   for k in "${cats[@]}"; do
     local list; list=$(cat_hosts "$k")
     [[ -z "$list" ]] && { printf "${C_R}未知分类: %s${NC}\n" "$k"; continue; }
@@ -453,12 +502,12 @@ run_categories() {
 # 排序输出最佳推荐
 print_best() {
   echo
-  printf "${C_B}══ 本机最优 SNI 排名 (仅列 TLS1.3 通过者，按握手升序) ══${NC}\n"
+  printf "${C_B}══ 本机最优 SNI 排名 (仅列证书有效且 TLS1.3 通过者，按握手升序) ══${NC}\n"
   local sorted top1=""
   sorted=$(printf '%s\n' "${RESULTS[@]}" \
     | awk -F'|' '$2!=999' | sort -t'|' -k2 -n)
   if [[ -z "$sorted" ]]; then
-    printf "${C_R}没有站点通过 TLS1.3，检查落地机出网/换候选列表${NC}\n"; return
+    printf "${C_R}没有站点满足证书有效且通过 TLS1.3，检查落地机出网/换候选列表${NC}\n"; return
   fi
   local rank=1
   while IFS='|' read -r host ac tag; do
@@ -556,6 +605,7 @@ menu_pick_region() {
 # 按地区跑：该区归属站 + 全球站，出排名
 run_region() {
   local r="$1" rh=() h
+  region_exists "$r" || { printf "${C_R}未知地区: %s${NC}\n" "$r"; return 1; }
   while IFS= read -r h; do [[ -n "$h" ]] && rh+=("$h"); done < <(region_hosts "$r")
   [[ ${#rh[@]} -eq 0 ]] && { printf "${C_R}未知地区: %s${NC}\n" "$r"; return 1; }
   RESULTS=()
@@ -617,7 +667,7 @@ fi
 # -r 按地区直接跑
 if [[ -n "$SEL_REGION" ]]; then
   run_region "$SEL_REGION"
-  exit 0
+  exit $?
 fi
 
 # 传了 CLI 参数(分类/追加/SNI_HOSTS 覆盖) → 直接跑，不进菜单
@@ -634,8 +684,10 @@ if [[ ${#SNI_OVERRIDE[@]} -gt 0 || ${#SEL_CATS[@]} -gt 0 || ${#EXTRA_HOSTS[@]} -
     fi
   fi
   print_best
-  echo; printf "${C_D}(可继续输入网址补测，直接回车退出)${NC}\n"
-  interactive_loop
+  if [[ -t 0 ]]; then
+    echo; printf "${C_D}(可继续输入网址补测，直接回车退出)${NC}\n"
+    interactive_loop
+  fi
   printf "${C_D}完成。${NC}\n"
   exit 0
 fi
